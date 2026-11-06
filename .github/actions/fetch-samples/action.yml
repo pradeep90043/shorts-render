@@ -1,8 +1,8 @@
 name: Fetch voice samples
 description: Downloads private assets (voice samples, music, stickers, watermarks) from the private app repository into ./assets. They are never stored in this public repo.
 inputs:
-  token:
-    description: Read-only token for the private app repository (secret SAMPLES_TOKEN)
+  key:
+    description: Private half of a read-only deploy key for the app repository (secret SAMPLES_KEY)
     required: true
   repo:
     description: Private repository that holds the assets
@@ -15,14 +15,17 @@ runs:
   steps:
     - shell: bash
       env:
-        TOKEN: ${{ inputs.token }}
+        KEY: ${{ inputs.key }}
         REPO: ${{ inputs.repo }}
         PATHS: ${{ inputs.paths }}
       run: |
-        if [ -z "$TOKEN" ]; then echo "::error::Secret SAMPLES_TOKEN is not set (a read-only token for $REPO)"; exit 1; fi
+        if [ -z "$KEY" ]; then echo "::error::Secret SAMPLES_KEY is not set (a read-only deploy key for $REPO)"; exit 1; fi
+        install -m 600 /dev/null /tmp/samples_key && printf '%s\n' "$KEY" > /tmp/samples_key
+        export GIT_SSH_COMMAND="ssh -i /tmp/samples_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
         rm -rf /tmp/private-samples
-        git clone --quiet --depth 1 --filter=blob:none --sparse "https://x-access-token:${TOKEN}@github.com/${REPO}.git" /tmp/private-samples
+        git clone --quiet --depth 1 --filter=blob:none --sparse "git@github.com:${REPO}.git" /tmp/private-samples
         git -C /tmp/private-samples sparse-checkout set --no-cone $PATHS
+        rm -f /tmp/samples_key
         mkdir -p assets
         cp -R /tmp/private-samples/assets/. assets/
         rm -rf /tmp/private-samples

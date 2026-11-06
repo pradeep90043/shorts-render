@@ -25,7 +25,7 @@ jobs:
       - name: Fetch music, stickers and watermarks (private)
         uses: ./.github/actions/fetch-samples
         with:
-          token: ${{ secrets.SAMPLES_TOKEN }}
+          key: ${{ secrets.SAMPLES_KEY }}
           paths: "/assets/music/ /assets/ambient/ /assets/stickers/ /assets/watermark*.png /assets/logo.png"
 
       - name: Set up FFmpeg with libass

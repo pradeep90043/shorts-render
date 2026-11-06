@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/fetch-samples
         with:
-          token: ${{ secrets.SAMPLES_TOKEN }}
+          key: ${{ secrets.SAMPLES_KEY }}
 
       - name: Cut the voice sample
         timeout-minutes: 10
