@@ -22,6 +22,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Fetch music, stickers and watermarks (private)
+        uses: ./.github/actions/fetch-samples
+        with:
+          token: ${{ secrets.SAMPLES_TOKEN }}
+          paths: "/assets/music/ /assets/ambient/ /assets/stickers/ /assets/watermark*.png /assets/logo.png"
+
       - name: Set up FFmpeg with libass
         run: |
           bash scripts/ensure_ffmpeg.sh

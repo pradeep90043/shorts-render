@@ -1,12 +1,15 @@
 name: Fetch voice samples
-description: Downloads the voice samples from the private app repository into ./assets (they are never stored in this public repo).
+description: Downloads private assets (voice samples, music, stickers, watermarks) from the private app repository into ./assets. They are never stored in this public repo.
 inputs:
   token:
     description: Read-only token for the private app repository (secret SAMPLES_TOKEN)
     required: true
   repo:
-    description: Private repository that holds assets/voice-samples and assets/verdict-clips
+    description: Private repository that holds the assets
     default: pradeep90043/shorts-automation
+  paths:
+    description: Space separated sparse-checkout patterns (gitignore style, from the repo root)
+    default: "/assets/voice-samples/ /assets/verdict-clips/"
 runs:
   using: composite
   steps:
@@ -14,12 +17,13 @@ runs:
       env:
         TOKEN: ${{ inputs.token }}
         REPO: ${{ inputs.repo }}
+        PATHS: ${{ inputs.paths }}
       run: |
         if [ -z "$TOKEN" ]; then echo "::error::Secret SAMPLES_TOKEN is not set (a read-only token for $REPO)"; exit 1; fi
         rm -rf /tmp/private-samples
         git clone --quiet --depth 1 --filter=blob:none --sparse "https://x-access-token:${TOKEN}@github.com/${REPO}.git" /tmp/private-samples
-        git -C /tmp/private-samples sparse-checkout set assets/voice-samples assets/verdict-clips
+        git -C /tmp/private-samples sparse-checkout set --no-cone $PATHS
         mkdir -p assets
         cp -R /tmp/private-samples/assets/. assets/
         rm -rf /tmp/private-samples
-        ls assets/voice-samples assets/verdict-clips
+        du -sh assets/* | head -20
