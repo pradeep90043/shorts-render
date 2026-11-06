@@ -1,0 +1,40 @@
+name: Shorts Cloud Video Renderer
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job ID (e.g. gen-1792229671335-733)"
+        required: true
+      bundle_url:
+        description: "URL to download short bundle tar.gz"
+        required: true
+
+concurrency:
+  group: render-short-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up FFmpeg with libass
+        run: |
+          bash scripts/ensure_ffmpeg.sh
+
+      - name: Render short video
+        run: |
+          python3 scripts/render_short.py \
+            --bundle "${{ inputs.bundle_url }}" \
+            --out "video_final.mp4"
+
+      - name: Upload rendered video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-short-${{ inputs.job_id }}
+          path: video_final.mp4
+          retention-days: 1

@@ -1,0 +1,213 @@
+name: Voicebox scenes
+
+# Narration for a VIDEO in the cloned voice: one audio file per scene, spoken on up to 20 runners at once.
+# The app (src/my-video/voiceboxNarration.ts) dispatches it with the scenes as lines named segment_<i>_<sceneId>, waits,
+# downloads the `voicebox-<tag>` artifact and drops the mp3 files into the my-video project, where
+# `longform:audio --external` measures them so every scene lasts exactly as long as its narration (see my-video render.yml).
+#   plan  -> shares the scene lines, in order, across the shards (a scene is never split or merged)
+#   speak -> one runner per shard: starts Voicebox, clones the voice, speaks its scenes
+#   join  -> trims the silence around each scene, converts to mp3, uploads voicebox-<tag>
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Name of this batch (artifact is voicebox-<tag>); the app uses the video slug
+        required: true
+      lines:
+        description: 'JSON list of {"name","text"}, one per scene; each becomes <name>.mp3'
+        required: true
+      engine:
+        description: chatterbox is multilingual (Hindi etc.); chatterbox_turbo is English only
+        default: chatterbox
+      language:
+        description: Language code
+        default: hi
+      max_shards:
+        description: How many runners at most (GitHub allows 20 at a time on the free plan)
+        default: '20'
+      shard_chars:
+        description: Characters of narration per runner (about 13 per second of Hindi speech)
+        default: '800'
+      sample_path:
+        description: Audio or video file in this repo used as the voice sample (the default one is paddy1, the CodeOrCap voice)
+        default: assets/voice-samples/paddy1.mp3
+      sample_start:
+        default: '0'
+        description: Seconds where the clean speech starts
+      sample_end:
+        default: '15'
+        description: Seconds where it ends (under 30)
+      sample_language:
+        description: Language spoken in the sample, for the automatic transcription (hi, en; empty = detect)
+        default: 'hi'
+      sample_text:
+        description: Exactly what is said in that part of the sample, or "auto" to transcribe it
+        default: auto
+      voice:
+        description: Name of the cloned voice profile
+        default: paddy1
+      speed:
+        description: Speaking speed (1.0 = natural, 0.92 = slightly slower and clearer for learners)
+        default: '1.0'
+      denoise:
+        description: Remove background hiss from the voice sample and from every generated scene (the sample has it, the clone repeats it)
+        default: 'true'
+      strip_noise:
+        description: Mute the noise the model keeps generating after a sentence ends (loud, no pitch; found by its missing pitch)
+        default: 'true'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Share the scenes across shards
+        id: plan
+        env:
+          LINES: ${{ inputs.lines }}
+        run: |
+          printf '%s' "$LINES" > lines.json
+          python3 -c "import json; d=json.load(open('lines.json')); print(len(d), 'scenes,', sum(len(x['text']) for x in d), 'characters')"
+          shards=$(python3 scripts/voicebox_plan.py --lines lines.json --out plan --max-shards "${{ inputs.max_shards }}" --shard-chars "${{ inputs.shard_chars }}")
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shards: $shards"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ github.run_id }}
+          path: plan/
+
+  speak:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-samples
+        with:
+          token: ${{ secrets.SAMPLES_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan-${{ github.run_id }}
+          path: plan/
+
+      - name: Cut the voice sample
+        timeout-minutes: 10
+        run: |
+          bash scripts/ensure_ffmpeg.sh
+          ffmpeg -hide_banner -loglevel error -y -ss "${{ inputs.sample_start }}" -to "${{ inputs.sample_end }}" -i "${{ inputs.sample_path }}" -vn -ac 1 -ar 24000 sample.wav
+
+      - name: Clean the voice sample (its background hiss would be cloned with the voice)
+        if: inputs.denoise == 'true'
+        run: |
+          MODEL="$PWD/bd.rnnn" bash scripts/voice_denoise.sh sample.wav sample-clean.wav
+          mv sample-clean.wav sample.wav
+
+      - name: Pre-pull the Voicebox image (in the background, while the model cache restores)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          setsid nohup docker pull ghcr.io/pradeep90043/voicebox-cpu:latest > /tmp/pull.log 2>&1 < /dev/null &
+          disown || true
+
+      - name: Restore model cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/vb-hf
+          key: voicebox-hf-${{ inputs.engine }}-v2
+
+      - name: Start Voicebox
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p ~/vb-hf && chmod -R 777 ~/vb-hf
+          docker run -d --name voicebox -p 127.0.0.1:17493:17493 \
+            -v "$HOME/vb-hf:/home/voicebox/.cache/huggingface" \
+            -e LOG_LEVEL=info -e NUMBA_CACHE_DIR=/tmp/numba_cache \
+            ghcr.io/pradeep90043/voicebox-cpu:latest
+
+      - name: Voice emotion patch (best effort)
+        # Lets Chatterbox read per-line expressiveness (scripts/voicebox_emotion.py). A failed or skipped patch changes nothing.
+        continue-on-error: true
+        timeout-minutes: 2   # never hold a voice shard for more than this: the patch is an extra, not a requirement
+        run: |
+          if timeout 90 docker exec -u root -i voicebox python3 - < scripts/voicebox_emotion_patch.py | tee /tmp/emo-patch.log | grep -q '^PATCHED'; then
+            docker restart voicebox >/dev/null
+            echo "emotion patch applied, Voicebox restarted"
+          else
+            cat /tmp/emo-patch.log || true
+          fi
+
+      - name: Speak this shard
+        run: |
+          pip install --quiet requests
+          python3 scripts/voicebox_tts.py --base http://127.0.0.1:17493 --sample sample.wav \
+            --sample-text "${{ inputs.sample_text }}" --sample-language "${{ inputs.sample_language }}" --lines plan/shard-${{ matrix.shard }}.json --out out \
+            --engine "${{ inputs.engine }}" --voice "${{ inputs.voice }}" --language "${{ inputs.language }}" --speed "${{ inputs.speed }}"
+
+      - name: Save model cache
+        if: matrix.shard == 0 && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/vb-hf
+          key: voicebox-hf-${{ inputs.engine }}-v2
+
+      - name: Container log (on failure)
+        if: failure()
+        run: docker logs voicebox 2>&1 | tail -150
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ github.run_id }}-${{ matrix.shard }}
+          path: out/*.wav
+          if-no-files-found: error
+
+  join:
+    needs: speak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-${{ github.run_id }}-*
+          merge-multiple: true
+          path: parts/
+
+      - name: Trim, convert to mp3
+        timeout-minutes: 15
+        run: |
+          bash scripts/ensure_ffmpeg.sh
+          mkdir -p final
+          # denoise (when asked), trim the silence around the speech, convert: scripts/voice_finish_scene.sh
+          [ "${{ inputs.denoise }}" = "true" ] && curl -fsSL --retry 3 -o bd.rnnn "https://raw.githubusercontent.com/GregorR/rnnoise-models/master/beguiling-drafter-2018-08-30/bd.rnnn"
+          python3 -m pip install --quiet numpy
+          ls parts/*.wav | OUT_DIR=final DENOISE="${{ inputs.denoise }}" STRIP_NOISE="${{ inputs.strip_noise }}" MODEL="$PWD/bd.rnnn" xargs -P 4 -n 1 bash scripts/voice_finish_scene.sh
+          echo "scenes: $(ls parts | wc -l) -> mp3: $(ls final | wc -l)"
+          [ "$(ls parts | wc -l)" = "$(ls final | wc -l)" ]
+          total=0; for f in final/*.mp3; do d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f"); total=$(awk "BEGIN{print $total+$d}"); done
+          echo "total narration seconds: $total"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voicebox-${{ inputs.tag }}
+          path: final/*.mp3
+          if-no-files-found: error

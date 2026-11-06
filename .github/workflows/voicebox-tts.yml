@@ -1,0 +1,113 @@
+name: Voicebox TTS
+
+# Speaks lines in a cloned voice on a GitHub runner (CPU), so nothing runs on a local machine.
+# The pipeline (or you) dispatches it with the lines and downloads the `voicebox-<tag>` artifact:
+#   gh workflow run voicebox-tts.yml -f tag=verdict -f lines='[{"name":"codeorcap_6","text":"Six."}]'
+#   gh run download <run-id> -n voicebox-verdict
+# Needs the image from voicebox-image.yml. Defaults clone the recorded person in the CodeOrCap verdict clip.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Name of this batch (artifact is voicebox-<tag>)
+        default: verdict
+        required: true
+      lines:
+        description: 'JSON list of {"name","text"}; each becomes <name>.wav'
+        required: true
+        default: '[{"name":"codeorcap_1","text":"One."},{"name":"codeorcap_2","text":"Two."},{"name":"codeorcap_3","text":"Three."},{"name":"codeorcap_4","text":"Four."},{"name":"codeorcap_5","text":"Five."},{"name":"codeorcap_6","text":"Six."},{"name":"codeorcap_7","text":"Seven."},{"name":"codeorcap_8","text":"Eight."},{"name":"codeorcap_9","text":"Nine."},{"name":"codeorcap_10","text":"Ten."}]'
+      engine:
+        description: Voicebox engine. chatterbox_turbo is English only and verified; chatterbox is multilingual (Hindi etc.)
+        default: chatterbox_turbo
+      language:
+        description: Language code of the lines
+        default: en
+      sample_path:
+        description: Audio or video file in this repo used as the voice sample
+        default: assets/verdict-clips/codeorcap_verdict_bg.mp4
+      sample_start:
+        description: Seconds into the sample file where the clean speech starts
+        default: '0.4'
+      sample_end:
+        description: Seconds where it ends (keep under 30)
+        default: '7.9'
+      sample_language:
+        description: Language spoken in the sample, for the automatic transcription (hi, en; empty = detect)
+        default: ''
+      sample_text:
+        description: Exactly what is said in that part of the sample, or "auto" to transcribe it
+        default: 'The verdict of this video is out of 10. For more info, check the caption. For tech reels, follow.'
+      voice:
+        description: Name of the cloned voice profile
+        default: codeorcap
+      speed:
+        description: Speaking speed (1.0 = natural, 0.92 = slightly slower and clearer for learners)
+        default: '1.0'
+      denoise:
+        description: Remove background hiss from the voice sample and from every generated scene (the sample has it, the clone repeats it)
+        default: 'true'
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  speak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-samples
+        with:
+          token: ${{ secrets.SAMPLES_TOKEN }}
+
+      - name: Cut the voice sample
+        timeout-minutes: 10
+        run: |
+          bash scripts/ensure_ffmpeg.sh
+          ffmpeg -hide_banner -loglevel error -y -ss "${{ inputs.sample_start }}" -to "${{ inputs.sample_end }}" -i "${{ inputs.sample_path }}" -vn -ac 1 -ar 24000 sample.wav
+
+      - name: Clean the voice sample (its background hiss would be cloned with the voice)
+        if: inputs.denoise == 'true'
+        run: |
+          MODEL="$PWD/bd.rnnn" bash scripts/voice_denoise.sh sample.wav sample-clean.wav
+          mv sample-clean.wav sample.wav
+          ls -l sample.wav
+
+      - name: Restore model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/vb-hf
+          key: voicebox-hf-${{ inputs.engine }}-v1
+
+      - name: Start Voicebox
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p ~/vb-hf && chmod -R 777 ~/vb-hf
+          docker run -d --name voicebox -p 127.0.0.1:17493:17493 \
+            -v "$HOME/vb-hf:/home/voicebox/.cache/huggingface" \
+            -e LOG_LEVEL=info -e NUMBA_CACHE_DIR=/tmp/numba_cache \
+            ghcr.io/pradeep90043/voicebox-cpu:latest
+
+      - name: Generate
+        env:
+          LINES: ${{ inputs.lines }}
+        run: |
+          printf '%s' "$LINES" > lines.json
+          pip install --quiet requests
+          python3 scripts/voicebox_tts.py --base http://127.0.0.1:17493 --sample sample.wav \
+            --sample-text "${{ inputs.sample_text }}" --sample-language "${{ inputs.sample_language }}" --lines lines.json --out out \
+            --engine "${{ inputs.engine }}" --voice "${{ inputs.voice }}" --language "${{ inputs.language }}" --speed "${{ inputs.speed }}"
+
+      - name: Container log (on failure)
+        if: failure()
+        run: docker logs voicebox 2>&1 | tail -150
+
+      - name: Upload audio
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicebox-${{ inputs.tag }}
+          path: out/*.wav
+          if-no-files-found: error

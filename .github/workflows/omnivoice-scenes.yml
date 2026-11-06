@@ -1,0 +1,195 @@
+name: OmniVoice scenes
+
+# FALLBACK narration in OmniVoice on CPU runners, used only when the Kaggle GPU run fails (src/audio/narration.ts).
+# Same contract as voicebox-scenes.yml, so the app reuses its dispatch/poll/download code (src/my-video/voiceboxNarration.ts):
+# lines named segment_<i>_<sceneId> in, one <name>.mp3 per line out in the `voicebox-<tag>` artifact.
+#   plan  -> shares the lines, in order, across the shards (a scene is never split or merged)
+#   speak -> one runner per shard: scripts/omnivoice_runner.py clones the channel voice and speaks its lines (~15x real time on CPU)
+#   join  -> trims the silence around each line, converts to mp3, uploads voicebox-<tag>
+# engine, sample_language, voice, denoise and strip_noise are accepted (the app sends them to both workflows) but not used here.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Name of this batch (artifact is voicebox-<tag>); the app uses the video slug
+        required: true
+      lines:
+        description: 'JSON list of {"name","text","emotion"?,"speaker"?}, one per scene; each becomes <name>.mp3'
+        required: true
+      narrator:
+        description: 'Designed narrator voice (e.g. "male, middle-aged, indian accent"); empty = clone the sample'
+        default: ''
+      characters:
+        description: 'JSON object {"<speaker>": "<OmniVoice voice design>"} for story characters (src/audio/omnivoice/job.ts)'
+        default: '{}'
+      language:
+        description: Language code
+        default: hi
+      speed:
+        description: Speaking speed (1.0 = natural)
+        default: '1.0'
+      max_shards:
+        description: How many runners at most (GitHub allows 20 at a time on the free plan)
+        default: '20'
+      shard_chars:
+        description: Characters of narration per runner (CPU is slow, keep shards small)
+        default: '250'
+      sample_path:
+        description: Audio file in this repo used as the voice sample
+        default: assets/voice-samples/paddy1_clean.mp3
+      sample_start:
+        default: '0'
+        description: Seconds where the clean speech starts
+      sample_end:
+        default: '12'
+        description: Seconds where it ends (under 20 with a transcript)
+      sample_text:
+        description: Exactly what is said in that part of the sample
+        default: ''
+      engine:
+        description: unused (Voicebox only)
+        default: ''
+      sample_language:
+        description: unused (Voicebox only)
+        default: ''
+      voice:
+        description: unused (Voicebox only)
+        default: ''
+      denoise:
+        description: unused (Voicebox only)
+        default: 'false'
+      strip_noise:
+        description: unused (Voicebox only)
+        default: 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Share the lines across shards
+        id: plan
+        env:
+          LINES: ${{ inputs.lines }}
+        run: |
+          printf '%s' "$LINES" > lines.json
+          python3 -c "import json; d=json.load(open('lines.json')); print(len(d), 'lines,', sum(len(x['text']) for x in d), 'characters')"
+          shards=$(python3 scripts/voicebox_plan.py --lines lines.json --out plan --max-shards "${{ inputs.max_shards }}" --shard-chars "${{ inputs.shard_chars }}")
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "shards: $shards"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ github.run_id }}
+          path: plan/
+
+  speak:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-samples
+        with:
+          token: ${{ secrets.SAMPLES_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan-${{ github.run_id }}
+          path: plan/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cut the voice sample
+        timeout-minutes: 10
+        run: |
+          bash scripts/ensure_ffmpeg.sh
+          ffmpeg -hide_banner -loglevel error -y -ss "${{ inputs.sample_start }}" -to "${{ inputs.sample_end }}" -i "${{ inputs.sample_path }}" -vn -ac 1 -ar 24000 sample.wav
+
+      - name: Restore model cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/huggingface
+          key: omnivoice-hf-v1
+
+      - name: Install OmniVoice (CPU)
+        run: |
+          pip install --quiet torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet omnivoice
+          pip install --quiet noisereduce || true   # steady-hiss cleaner; optional
+
+      - name: Speak this shard
+        env:
+          CHARACTERS: ${{ inputs.characters }}
+          NARRATOR: ${{ inputs.narrator }}
+          SAMPLE_TEXT: ${{ inputs.sample_text }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          job = {"tag": "${{ inputs.tag }}", "language": "${{ inputs.language }}", "speed": float("${{ inputs.speed }}" or 1.0), "format": "wav",
+                 "sample": {"file": "sample.wav", "text": os.environ.get("SAMPLE_TEXT", "")},
+                 "characters": json.loads(os.environ.get("CHARACTERS") or "{}"), "lines": []}
+          if os.environ.get("NARRATOR"):
+              job["narrator"] = os.environ["NARRATOR"]
+          json.dump(job, open("job.json", "w"), ensure_ascii=False)
+          PY
+          python3 scripts/omnivoice_runner.py --job job.json --lines plan/shard-${{ matrix.shard }}.json --sample sample.wav --device cpu --out out
+
+      - name: Save model cache
+        if: matrix.shard == 0 && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/huggingface
+          key: omnivoice-hf-v1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ github.run_id }}-${{ matrix.shard }}
+          path: out/*.wav
+          if-no-files-found: error
+
+  join:
+    needs: speak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-${{ github.run_id }}-*
+          merge-multiple: true
+          path: parts/
+
+      - name: Trim, convert to mp3
+        timeout-minutes: 15
+        run: |
+          bash scripts/ensure_ffmpeg.sh
+          mkdir -p final
+          # OmniVoice output is clean: no denoise, no pitchless-noise strip (those fix Chatterbox artefacts)
+          ls parts/*.wav | OUT_DIR=final DENOISE=false STRIP_NOISE=false xargs -P 4 -n 1 bash scripts/voice_finish_scene.sh
+          echo "lines: $(ls parts | wc -l) -> mp3: $(ls final | wc -l)"
+          [ "$(ls parts | wc -l)" = "$(ls final | wc -l)" ]
+          total=0; for f in final/*.mp3; do d=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f"); total=$(awk "BEGIN{print $total+$d}"); done
+          echo "total narration seconds: $total"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voicebox-${{ inputs.tag }}
+          path: final/*.mp3
+          if-no-files-found: error
