@@ -1,0 +1,47 @@
+name: Member transcribe
+
+# Automatic captions for a member's video (speech-to-text with faster-whisper). Same encrypted-job contract as member-edit.yml:
+# this repo is public, so the job travels encrypted and the run title carries only the post id. See scripts/member_transcribe.py.
+run-name: member-transcribe ${{ inputs.post_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_id:
+        description: Post id (only used to find the run)
+        required: true
+      job:
+        description: Encrypted job
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: member-transcribe-${{ inputs.post_id }}
+  cancel-in-progress: false
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up FFmpeg
+        run: bash scripts/ensure_ffmpeg.sh
+
+      - name: Cache the speech model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-small-v1
+
+      - name: Install the libraries
+        run: python3 -m pip install --quiet cryptography numpy faster-whisper
+
+      - name: Transcribe
+        env:
+          JOB: ${{ inputs.job }}
+          MEMBER_EDIT_KEY: ${{ secrets.MEMBER_EDIT_KEY }}
+        run: python3 scripts/member_transcribe.py

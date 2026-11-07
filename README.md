@@ -11,6 +11,7 @@ dispatches these workflows through the GitHub API and downloads their artifacts.
 | `voicebox-narration.yml` | Cloned-voice narration for one long script |
 | `voicebox-tts.yml` | Single-runner cloned-voice speech |
 | `omnivoice-scenes.yml` | Same contract as voicebox-scenes with the OmniVoice engine |
+| `member-transcribe.yml` | Automatic captions (faster-whisper) for a member video; encrypted job |
 | `member-edit.yml` | Edits a member's uploaded video (trim, aspect, captions, watermark); the job arrives encrypted |
 | `voicebox-image.yml` | Builds the Voicebox CPU image (the current image is already public on GHCR) |
 
