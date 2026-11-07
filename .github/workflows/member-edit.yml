@@ -1,0 +1,43 @@
+name: Member edit
+
+# Renders a member's video edit (trim, aspect, captions, watermark, loudness) for the CODE OR CAP Studio.
+# This repo is public, so the job arrives ENCRYPTED in `job` (AES-256-GCM; key in the MEMBER_EDIT_KEY secret) and the run title
+# carries only the post id. The runner downloads the source with a presigned link, uploads the result with presigned links,
+# and never prints a link. See scripts/member_edit.py.
+run-name: member-edit ${{ inputs.post_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_id:
+        description: Post id (only used to find the run)
+        required: true
+      job:
+        description: Encrypted job
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: member-edit-${{ inputs.post_id }}
+  cancel-in-progress: false
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up FFmpeg with libass
+        run: bash scripts/ensure_ffmpeg.sh
+
+      - name: Install the decryption library
+        run: python3 -m pip install --quiet cryptography
+
+      - name: Edit
+        env:
+          JOB: ${{ inputs.job }}
+          MEMBER_EDIT_KEY: ${{ secrets.MEMBER_EDIT_KEY }}
+        run: python3 scripts/member_edit.py

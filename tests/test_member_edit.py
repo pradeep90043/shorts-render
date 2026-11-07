@@ -1,0 +1,124 @@
+"""Runs scripts/member_edit.py for real against a local HTTP server that plays the bucket.
+FFMPEG=/path/to/ffmpeg-with-libass FFPROBE=/path/to/ffprobe SKIP_FONT_INSTALL=1 python3 tests/test_member_edit.py"""
+import base64, json, os, subprocess, sys, tempfile, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+import member_edit as me  # noqa: E402
+
+FFMPEG, FFPROBE = me.FFMPEG, me.FFPROBE
+KEY = base64.b64encode(os.urandom(32)).decode()
+STORE = {}
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        d = STORE.get(self.path)
+        if d is None: self.send_response(404); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Length", str(len(d))); self.end_headers(); self.wfile.write(d)
+    def do_PUT(self):
+        STORE[self.path] = self.rfile.read(int(self.headers["Content-Length"])); self.send_response(200); self.end_headers()
+
+
+srv = HTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
+BASE = f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+def seal(payload):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    iv = os.urandom(12)
+    ct = AESGCM(base64.b64decode(KEY)).encrypt(iv, json.dumps(payload).encode(), None)
+    e = lambda b: base64.urlsafe_b64encode(b).decode().rstrip("=")
+    return f"v1.{e(iv)}.{e(ct)}"
+
+
+def make_src(name, w, h, secs=6, audio=True):
+    with tempfile.TemporaryDirectory() as t:
+        p = os.path.join(t, "s.mp4")
+        cmd = [FFMPEG, "-loglevel", "error", "-y", "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=30:duration={secs}"]
+        if audio: cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={secs}"]
+        cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p"] + (["-c:a", "aac", "-shortest"] if audio else []) + [p]
+        subprocess.run(cmd, check=True)
+        STORE[f"/{name}"] = open(p, "rb").read()
+
+
+def edit(name, spec, src=None, env_extra=None):
+    for k in ("out", "thumb", "res"): STORE.pop(f"/{name}-{k}", None)
+    job = {"v": 1, "postId": name, "srcUrl": f"{BASE}/{src or name}", "dstUrl": f"{BASE}/{name}-out", "thumbUrl": f"{BASE}/{name}-thumb", "resUrl": f"{BASE}/{name}-res", "spec": spec}
+    env = {**os.environ, "JOB": seal(job), "MEMBER_EDIT_KEY": KEY, "SKIP_FONT_INSTALL": "1", **(env_extra or {})}
+    p = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "scripts", "member_edit.py")], env=env, capture_output=True, text=True)
+    res = json.loads(STORE[f"/{name}-res"]) if f"/{name}-res" in STORE else None
+    return p, res
+
+
+def info(name):
+    with tempfile.TemporaryDirectory() as t:
+        p = os.path.join(t, "o.mp4"); open(p, "wb").write(STORE[f"/{name}-out"])
+        j = json.loads(subprocess.run([FFPROBE, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", p], capture_output=True, text=True).stdout)
+        v = next(s for s in j["streams"] if s["codec_type"] == "video")
+        return int(v["width"]), int(v["height"]), float(j["format"]["duration"]), any(s["codec_type"] == "audio" for s in j["streams"])
+
+
+def frame_hash(name, at):
+    with tempfile.TemporaryDirectory() as t:
+        p = os.path.join(t, "o.mp4"); open(p, "wb").write(STORE[f"/{name}-out"])
+        return subprocess.run([FFMPEG, "-loglevel", "error", "-ss", str(at), "-i", p, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "bmp", "-"], capture_output=True).stdout
+
+
+base = {"trim": {"start": 0, "end": 6}, "aspect": "9:16", "fit": "fit", "captions": [], "thumbnailAt": 1, "loudnorm": True}
+make_src("wide", 1280, 720); make_src("tall", 720, 1280); make_src("silent", 640, 360, 4, audio=False)
+
+# aspect and fit combinations
+for src, aspect, fit, want in [("wide", "9:16", "fit", (1080, 1920)), ("wide", "9:16", "fill", (1080, 1920)), ("wide", "1:1", "fill", (1080, 1080)),
+                               ("tall", "16:9", "fit", (1920, 1080)), ("tall", "9:16", "fit", (1080, 1920)), ("wide", "16:9", "fit", (1920, 1080))]:
+    n = f"{src}-{aspect.replace(':', 'x')}-{fit}"
+    p, res = edit(n, {**base, "aspect": aspect, "fit": fit}, src=src)
+    assert p.returncode == 0 and res and res["ok"], (n, p.stderr[-400:], res)
+    w, h, d, a = info(n)
+    assert (w, h) == want, (n, w, h)
+    assert abs(d - 6) < 0.3 and a, (n, d, a)
+    assert (res["width"], res["height"]) == want
+    assert f"/{n}-thumb" in STORE and STORE[f"/{n}-thumb"][:2] == b"\xff\xd8", "thumbnail is a jpeg"
+print("aspect/fit ok")
+
+# trim + original keeps the shape, even dimensions, right length
+make_src("orig", 1280, 720)
+p, res = edit("orig", {**base, "aspect": "original", "trim": {"start": 1, "end": 4}})
+w, h, d, a = info("orig"); assert (w, h) == (1280, 720) and abs(d - 3) < 0.3, (w, h, d)
+assert abs(res["durationSec"] - 3) < 0.3
+print("trim/original ok")
+
+# captions and watermark change the picture; Hindi text works; the same edit without them differs
+p0, r0 = edit("cap", {**base, "aspect": "9:16"}, src="wide"); plain = frame_hash("cap", 1.5)
+spec = {**base, "captions": [{"start": 1, "end": 3, "text": "Hello captions"}, {"start": 3, "end": 5, "text": "नमस्ते दोस्तों"}], "watermark": {"text": "@mychannel", "position": "br"}}
+p1, r1 = edit("cap", spec, src="wide")
+assert p1.returncode == 0 and r1["ok"], p1.stderr[-500:]
+assert frame_hash("cap", 1.5) != plain, "captions were burned in"
+if os.environ.get("DUMP_DIR"):
+    for t in (1.5, 4):
+        open(os.path.join(os.environ["DUMP_DIR"], f"cap-{t}.bmp"), "wb").write(frame_hash("cap", t))
+print("captions ok")
+
+# source without audio: no audio stream out, no error
+p, res = edit("silent", {**base, "trim": {"start": 0, "end": 3}})
+assert res["ok"], p.stderr[-300:]
+assert info("silent")[3] is False
+print("silent source ok")
+
+# problems are reported in plain words and never contain a link
+p, res = edit("late", {**base, "trim": {"start": 5.9, "end": 6}}, src="wide")
+assert res and not res["ok"] and "past the end" in res["error"], res
+bad = {"v": 1, "postId": "x", "srcUrl": f"{BASE}/missing", "dstUrl": f"{BASE}/x-out", "thumbUrl": f"{BASE}/x-thumb", "resUrl": f"{BASE}/x-res", "spec": base}
+p = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "scripts", "member_edit.py")], env={**os.environ, "JOB": seal(bad), "MEMBER_EDIT_KEY": KEY}, capture_output=True, text=True)
+res = json.loads(STORE["/x-res"]); assert not res["ok"] and "download" in res["error"] and BASE not in json.dumps(res)
+assert BASE not in p.stderr.replace("::add-mask::", ""), "no link in the log"
+# a wrong key cannot open the job
+p = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "scripts", "member_edit.py")], env={**os.environ, "JOB": seal(bad), "MEMBER_EDIT_KEY": base64.b64encode(os.urandom(32)).decode()}, capture_output=True, text=True)
+assert p.returncode != 0
+print("failures ok")
+
+# ASS text is safe: braces and backslashes cannot inject styling
+a = me.make_ass({**base, "captions": [{"start": 0, "end": 1, "text": r"{\an8}bad\Ntext"}]}, 1080, 1920, 6)
+assert "{\\an8}" not in a.split("[Events]")[1] and "bad" in a
+print("all ok")
