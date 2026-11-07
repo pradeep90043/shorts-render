@@ -7,7 +7,10 @@ MEMBER_EDIT_KEY secret. It holds presigned links to the member's video in a priv
 
   segments [{start,end,speed,volume}] (the kept parts of the source, in order; older jobs have one trim {start,end}),
   aspect 9:16|1:1|16:9|original, fit fit|fill, captions [{start,end,text}] and texts [text layers] (times on the EDITED timeline),
-  watermark {text,position}, thumbnailAt, loudnorm
+  watermark {text,position}, thumbnailAt, loudnorm,
+  background {mode none|blur|color|gradient|image, color, color2, assetId} (person cut-out over a new background),
+  overlays [{assetId,start,end,x,y,w,rot,opacity}] (image/sticker layers), photo {seconds,motion} (the source is a still picture)
+  and assetUrls {assetId: presigned link} for the images the edit uses
 
 Output: an edited mp4, a thumbnail and a small result.json, each PUT to its presigned link. Nothing here prints a link.
 Test hooks: FFMPEG / FFPROBE environment variables.
@@ -96,7 +99,26 @@ def segment_graph(segs: list, has_audio: bool, loudnorm: bool) -> str:
     return ";".join(parts)
 
 
-def video_graph(spec: dict, w: int, h: int, ass_path, inp: str = "[vc]"):
+def overlay_chain(overlays: list, tw: int, th: int, first_input: int = 1, inp: str = "[b]"):
+    """Image layers over the picture, one extra ffmpeg input each (input numbers start at first_input). Returns (graph, last label)."""
+    parts, cur = [], inp
+    for k, o in enumerate(overlays):
+        n = first_input + k
+        wpx = max(2, int(tw * float(o["w"]) / 100) // 2 * 2)
+        rot = float(o.get("rot", 0))
+        f = f"[{n}:v]scale={wpx}:-2,format=rgba"
+        if abs(rot) > 0.01:
+            f += f",rotate=a={rot}*PI/180:c=none:ow=rotw({rot}*PI/180):oh=roth({rot}*PI/180)"
+        if float(o.get("opacity", 1)) < 0.999:
+            f += f",colorchannelmixer=aa={float(o['opacity'])}"
+        parts.append(f + f"[o{k}]")
+        nxt = f"[ov{k}]"
+        parts.append(f"{cur}[o{k}]overlay=x=W*{float(o['x'])}/100-w/2:y=H*{float(o['y'])}/100-h/2:enable='between(t,{float(o['start'])},{float(o['end'])})':eof_action=repeat{nxt}")
+        cur = nxt
+    return ";".join(parts), cur
+
+
+def video_graph(spec: dict, w: int, h: int, ass_path, inp: str = "[vc]", overlays=None):
     """Returns (filter_complex from `inp` to [v], out_w, out_h): the shape (fit/fill), then the subtitles."""
     tw, th = target_size(spec["aspect"], w, h)
     same_shape = abs(w / h - tw / th) < 0.01
@@ -111,7 +133,11 @@ def video_graph(spec: dict, w: int, h: int, ass_path, inp: str = "[vc]"):
             f"[s2]scale={tw}:{th}:force_original_aspect_ratio=decrease:flags=lanczos,setsar=1[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[b]"
         )
-    tail = f";[b]ass='{ass_path}'[c];[c]format=yuv420p[v]" if ass_path else ";[b]format=yuv420p[v]"
+    cur = "[b]"
+    if overlays:
+        og, cur = overlay_chain(overlays, tw, th)
+        base += ";" + og
+    tail = f";{cur}ass='{ass_path}'[c];[c]format=yuv420p[v]" if ass_path else f";{cur}format=yuv420p[v]"
     return base + tail, tw, th
 
 
@@ -178,12 +204,157 @@ def make_ass(spec: dict, w: int, h: int, length: float):
     return "\n".join(out) + "\n"
 
 
-def ffmpeg_args(src: str, out: str, graph: str, has_audio: bool) -> list:
-    a = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-filter_complex", graph, "-map", "[v]"]
+def ffmpeg_args(src: str, out: str, graph: str, has_audio: bool, extra_inputs=None, length=None) -> list:
+    a = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", src]
+    for img in extra_inputs or []:
+        a += ["-loop", "1", "-framerate", "30", "-t", str(round((length or 60) + 1, 2)), "-i", img]
+    a += ["-filter_complex", graph, "-map", "[v]"]
     if has_audio:
         a += ["-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-ar", "44100"]
-    a += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-r", "30", out]
-    return a
+    a += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-r", "30"]
+    if length:
+        a += ["-t", str(round(length, 3))]
+    return a + [out]
+
+
+# ── still picture to moving video ──────────────────────────────────────────────────────────────
+PHOTO_MOTIONS = ("zoom-in", "zoom-out", "pan-left", "pan-right")
+FPS = 30
+
+
+def photo_filter(motion: str, frames: int, w: int, h: int) -> str:
+    """A slow zoom or pan over the picture. The picture is enlarged first so the movement stays smooth (no pixel jitter)."""
+    n = max(2, frames)
+    if motion == "zoom-out":
+        z, x = f"1.3-0.3*on/{n}", "iw/2-(iw/zoom/2)"
+    elif motion == "pan-left":
+        z, x = "1.25", f"(iw-iw/zoom)*(1-on/{n})"
+    elif motion == "pan-right":
+        z, x = "1.25", f"(iw-iw/zoom)*on/{n}"
+    else:
+        z, x = f"1+0.3*on/{n}", "iw/2-(iw/zoom/2)"
+    return f"scale={w * 2}:{h * 2}:flags=lanczos,zoompan=z='{z}':x='{x}':y='ih/2-(ih/zoom/2)':d={n}:s={w}x{h}:fps={FPS},setsar=1,format=yuv420p"
+
+
+def photo_video(img: str, photo: dict, work: str) -> str:
+    """Turns the picture into a silent clip of photo.seconds, so the rest of the editor treats it like any other video."""
+    seconds = max(1.0, min(60.0, float(photo.get("seconds", 8))))
+    motion = photo.get("motion", "zoom-in")
+    if motion not in PHOTO_MOTIONS:
+        motion = "zoom-in"
+    iw, ih, _, _ = probe(img)
+    scale = min(1.0, 1920 / max(iw, ih))
+    w, h = max(2, int(iw * scale) // 2 * 2), max(2, int(ih * scale) // 2 * 2)
+    out = os.path.join(work, "photo.mp4")
+    frames = int(round(seconds * FPS))
+    run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", img, "-vf", photo_filter(motion, frames, w, h), "-frames:v", str(frames),
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(FPS), out], "Animating the picture")
+    return out
+
+
+# ── background removal ─────────────────────────────────────────────────────────────────────────
+SEGMENTER_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
+MAX_CUTOUT_SECONDS = 180
+WORK_LONG_SIDE = 1280
+
+
+def ensure_segmenter(work: str) -> str:
+    """Installs the (free, open-source) person segmentation library the first time it is needed and fetches its small model."""
+    try:
+        import cv2, mediapipe, numpy  # noqa: F401
+    except ImportError:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "mediapipe", "opencv-python-headless", "numpy"], capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            print("segmentation install failed:", (r.stderr or "")[-300:], file=sys.stderr)
+            raise EditError("Background removal is not available right now.")
+    model = os.environ.get("SEGMENTER_MODEL") or os.path.join(work, "selfie.tflite")
+    if not os.path.exists(model):
+        r = subprocess.run(["curl", "-sS", "-f", "-L", "--retry", "3", "--connect-timeout", "20", "--max-time", "120", "-o", model, SEGMENTER_URL], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise EditError("Background removal is not available right now.")
+    return model
+
+
+def gradient_image(c1: str, c2: str, w: int, h: int):
+    import numpy as np
+    a = np.array([int(c1[i:i + 2], 16) for i in (1, 3, 5)], dtype=np.float32)
+    b = np.array([int(c2[i:i + 2], 16) for i in (1, 3, 5)], dtype=np.float32)
+    t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]
+    return np.broadcast_to(a * (1 - t) + b * t, (h, w, 3)).astype(np.uint8).copy()
+
+
+def remove_background(src: str, bg: dict, asset_path, start: float, end: float, w: int, h: int, has_audio: bool, work: str) -> str:
+    """Cuts the person out of [start, end] of the source and puts them over a new background. Returns a new video that starts at
+    `start` of the source, with the original sound; the normal edit then runs on it."""
+    if end - start > MAX_CUTOUT_SECONDS:
+        raise EditError(f"Background removal works on up to {MAX_CUTOUT_SECONDS // 60} minutes of video. Trim the video first.")
+    model = ensure_segmenter(work)
+    import cv2
+    import mediapipe as mp
+    import numpy as np
+    from mediapipe.tasks.python import BaseOptions, vision
+
+    scale = min(1.0, WORK_LONG_SIDE / max(w, h))
+    ow, oh = max(2, int(w * scale) // 2 * 2), max(2, int(h * scale) // 2 * 2)
+    mode = bg.get("mode", "blur")
+    still = None
+    if mode == "color":
+        still = np.zeros((oh, ow, 3), np.uint8)
+        still[:] = [int(bg.get("color", "#00b140")[i:i + 2], 16) for i in (1, 3, 5)]
+    elif mode == "gradient":
+        still = gradient_image(bg.get("color", "#1a1a2e"), bg.get("color2", "#e94560"), ow, oh)
+    elif mode == "image":
+        if not asset_path:
+            raise EditError("The background picture is missing.")
+        img = cv2.imread(asset_path)
+        if img is None:
+            raise EditError("The background picture could not be read.")
+        k = max(ow / img.shape[1], oh / img.shape[0])  # cover the frame, centred
+        img = cv2.resize(img, (max(ow, int(img.shape[1] * k + 0.5)), max(oh, int(img.shape[0] * k + 0.5))), interpolation=cv2.INTER_AREA)
+        y0, x0 = (img.shape[0] - oh) // 2, (img.shape[1] - ow) // 2
+        still = img[y0:y0 + oh, x0:x0 + ow].copy()
+        still = cv2.cvtColor(still, cv2.COLOR_BGR2RGB)
+
+    seg = vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
+        base_options=BaseOptions(model_asset_path=model), running_mode=vision.RunningMode.IMAGE, output_confidence_masks=True, output_category_mask=False))
+
+    out = os.path.join(work, "cutout.mp4")
+    length = round(end - start, 3)
+    dec = subprocess.Popen([FFMPEG, "-hide_banner", "-loglevel", "error", "-ss", str(start), "-t", str(length), "-i", src, "-vf", f"fps={FPS},scale={ow}:{oh}",
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    enc_cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{ow}x{oh}", "-r", str(FPS), "-i", "-"]
+    if has_audio:
+        enc_cmd += ["-ss", str(start), "-t", str(length), "-i", src, "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "160k", "-ar", "44100"]
+    enc_cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-shortest", out]
+    enc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE)
+    size, frames, prev = ow * oh * 3, 0, None
+    try:
+        while True:
+            buf = dec.stdout.read(size)
+            if len(buf) < size:
+                break
+            frame = np.frombuffer(buf, np.uint8).reshape(oh, ow, 3)
+            m = seg.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)).confidence_masks[0].numpy_view()
+            m = cv2.resize(np.squeeze(m).astype(np.float32), (ow, oh), interpolation=cv2.INTER_LINEAR)
+            if prev is not None:
+                m = 0.65 * m + 0.35 * prev  # a little smoothing over time stops the edge from flickering
+            prev = m
+            m = np.clip((m - 0.35) / 0.3, 0, 1)  # firm up the edge
+            m = cv2.GaussianBlur(m, (0, 0), 1.2)[:, :, None]
+            back = cv2.GaussianBlur(frame, (0, 0), 28) if mode == "blur" else still
+            enc.stdin.write((frame * m + back * (1 - m)).astype(np.uint8).tobytes())
+            frames += 1
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            enc.stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+        dec.stdout.close()
+    if enc.wait(timeout=600) != 0 or dec.wait(timeout=60) != 0 or frames < 2:
+        raise EditError("Removing the background failed.")
+    return out
 
 
 # ── plumbing ───────────────────────────────────────────────────────────────────────────────────
@@ -252,10 +423,28 @@ def ensure_fonts(spec: dict, need_subtitles: bool):
         print(f"font setup skipped: {exc}")
 
 
+def fetch_assets(job: dict, work: str) -> dict:
+    """Downloads the pictures the edit uses (stickers, background) and returns {assetId: local path}."""
+    paths = {}
+    for aid, url in (job.get("assetUrls") or {}).items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", aid):
+            continue
+        dest = os.path.join(work, f"asset_{aid}")
+        try:
+            curl_get(url, dest)
+        except EditError:
+            raise EditError("Could not download one of your pictures.")
+        paths[aid] = dest
+    return paths
+
+
 def render(job: dict, work: str) -> dict:
     spec = job["spec"]
     src = os.path.join(work, "src")
     curl_get(job["srcUrl"], src)
+    assets = fetch_assets(job, work)
+    if spec.get("photo"):
+        src = photo_video(src, spec["photo"], work)
     w, h, duration, has_audio = probe(src)
     segs = []
     for g in segments_of(spec):
@@ -266,6 +455,14 @@ def render(job: dict, work: str) -> dict:
             segs.append(g)
     if not segs:
         raise EditError("The kept parts are past the end of the video.")
+
+    bg = spec.get("background") or {}
+    if bg.get("mode", "none") != "none" and not spec.get("photo"):
+        a, b = min(g["start"] for g in segs), max(g["end"] for g in segs)
+        src = remove_background(src, bg, assets.get(bg.get("assetId")), a, b, w, h, has_audio, work)
+        for g in segs:  # the cut-out video starts at the first kept second
+            g["start"], g["end"] = round(g["start"] - a, 3), round(g["end"] - a, 3)
+        w, h, duration, has_audio = probe(src)
     spec["segments"] = segs
     length = edited_length(segs)
 
@@ -277,10 +474,11 @@ def render(job: dict, work: str) -> dict:
         ass_path = os.path.join(work, "sub.ass")
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass)
-    vg, ow, oh = video_graph(spec, w, h, ass_path.replace("\\", "/").replace(":", "\\:") if ass_path else None)
+    layers = [o for o in (spec.get("overlays") or []) if o.get("assetId") in assets]
+    vg, ow, oh = video_graph(spec, w, h, ass_path.replace("\\", "/").replace(":", "\\:") if ass_path else None, overlays=layers)
     graph = segment_graph(segs, has_audio, spec.get("loudnorm", True)) + ";" + vg
     out = os.path.join(work, "out.mp4")
-    run(ffmpeg_args(src, out, graph, has_audio), "Editing the video")
+    run(ffmpeg_args(src, out, graph, has_audio, [assets[o["assetId"]] for o in layers], length), "Editing the video")
 
     thumb = os.path.join(work, "thumb.jpg")
     run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(min(spec.get("thumbnailAt", 0), max(0, length - 0.1))), "-i", out, "-frames:v", "1", "-vf", "scale=720:-2", "-q:v", "3", thumb], "Making the thumbnail", 120)

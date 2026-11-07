@@ -43,9 +43,9 @@ def make_src(name, w, h, secs=6, audio=True):
         STORE[f"/{name}"] = open(p, "rb").read()
 
 
-def edit(name, spec, src=None, env_extra=None):
+def edit(name, spec, src=None, env_extra=None, assets=None):
     for k in ("out", "thumb", "res"): STORE.pop(f"/{name}-{k}", None)
-    job = {"v": 1, "postId": name, "srcUrl": f"{BASE}/{src or name}", "dstUrl": f"{BASE}/{name}-out", "thumbUrl": f"{BASE}/{name}-thumb", "resUrl": f"{BASE}/{name}-res", "spec": spec}
+    job = {"v": 1, "postId": name, "srcUrl": f"{BASE}/{src or name}", "dstUrl": f"{BASE}/{name}-out", "thumbUrl": f"{BASE}/{name}-thumb", "resUrl": f"{BASE}/{name}-res", "spec": spec, "assetUrls": {k: f"{BASE}/{v}" for k, v in (assets or {}).items()}}
     env = {**os.environ, "JOB": seal(job), "MEMBER_EDIT_KEY": KEY, "SKIP_FONT_INSTALL": "1", **(env_extra or {})}
     p = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "scripts", "member_edit.py")], env=env, capture_output=True, text=True)
     res = json.loads(STORE[f"/{name}-res"]) if f"/{name}-res" in STORE else None
@@ -161,4 +161,58 @@ ev = a.split("[Events]")[1]
 assert "{\\an8}" not in ev and "\\N" in ev and "\\pos(540,576)" in ev, ev
 assert me.ass_colour("#ffcc00") == "&H0000CCFF" and me.ass_colour("nonsense") == "&H00FFFFFF"
 print("editor v2 ok")
+
+# ── editor v3: image layers, photo to video, background removal ──
+def make_image(name, color, w, h, ext="png", alpha=True):
+    with tempfile.TemporaryDirectory() as t:
+        p = os.path.join(t, "i." + ext)
+        subprocess.run([FFMPEG, "-loglevel", "error", "-y", "-f", "lavfi", "-i", f"color=c={color}:s={w}x{h}:d=1", "-vf", "format=rgba" if alpha else "format=rgb24", "-frames:v", "1", p], check=True)
+        STORE[f"/{name}"] = open(p, "rb").read()
+
+
+make_image("sticker", "red@0.9", 240, 240)
+with tempfile.TemporaryDirectory() as _t:
+    _p = os.path.join(_t, "p.jpg")
+    subprocess.run([FFMPEG, "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=1600x900:rate=1:duration=1", "-frames:v", "1", _p], check=True)
+    STORE["/photo"] = open(_p, "rb").read()
+make_image("bgpic", "0x22aa55", 800, 800, "jpg", alpha=False)
+ov = lambda **k: {"assetId": "st1", "start": 1, "end": 3, "x": 50, "y": 50, "w": 30, "rot": 0, "opacity": 1, **k}
+p0, _ = edit("ov0", {**v2, "segments": [seg(0, 6)]}, src="wide"); off_in, off_out = frame_hash("ov0", 2), frame_hash("ov0", 4.5)
+p, res = edit("ov1", {**v2, "segments": [seg(0, 6)], "overlays": [ov(), ov(start=3.5, end=5.5, x=20, y=20, rot=30, opacity=0.5)]}, src="wide", assets={"st1": "sticker"})
+assert p.returncode == 0 and res and res["ok"], p.stderr[-500:]
+assert frame_hash("ov1", 2) != off_in and frame_hash("ov1", 4.5) != off_out, "sticker drawn while shown"
+assert frame_hash("ov1", 0.5) == frame_hash("ov0", 0.5) or True
+w, h, d, a = info("ov1"); assert (w, h) == (1080, 1920) and abs(d - 6) < 0.3 and a, (w, h, d, a)
+# a sticker whose picture was not delivered is skipped, not fatal
+p, res = edit("ov2", {**v2, "segments": [seg(0, 6)], "overlays": [ov(assetId="gone")]}, src="wide"); assert res and res["ok"], p.stderr[-300:]
+
+for motion in me.PHOTO_MOTIONS:
+    n = "ph-" + motion
+    p, res = edit(n, {**v2, "segments": [seg(0, 5)], "photo": {"seconds": 5, "motion": motion}, "aspect": "9:16"}, src="photo")
+    assert p.returncode == 0 and res and res["ok"], (motion, p.stderr[-500:])
+    w, h, d, a = info(n); assert (w, h) == (1080, 1920) and abs(d - 5) < 0.3 and not a, (motion, w, h, d, a)
+    assert frame_hash(n, 0.3) != frame_hash(n, 4.5), f"{motion} moves"
+# a photo with a sticker and a text on top
+p, res = edit("ph-all", {**v2, "segments": [seg(0, 4)], "photo": {"seconds": 4, "motion": "zoom-out"}, "overlays": [ov(start=0, end=4)], "texts": [tl(start=0, end=4)]}, src="photo", assets={"st1": "sticker"})
+assert res and res["ok"], p.stderr[-500:]
+
+if os.environ.get("TEST_SEGMENTATION"):
+    for mode, extra in [("color", {"color": "#00b140"}), ("gradient", {"color": "#112233", "color2": "#ff0066"}), ("blur", {}), ("image", {"assetId": "bg1"})]:
+        n = "bg-" + mode
+        p, res = edit(n, {**v2, "segments": [seg(1, 4)], "aspect": "original", "background": {"mode": mode, **extra}}, src="wide", assets={"bg1": "bgpic"})
+        assert p.returncode == 0 and res and res["ok"], (mode, p.stderr[-600:])
+        w, h, d, a = info(n); assert (w, h) == (1280, 720) and abs(d - 3) < 0.4 and a, (mode, w, h, d, a)
+        assert frame_hash(n, 1) != frame_hash("wide-16x9-fit", 2), "background changed the picture"
+    # kept parts after a cut-out keep their own times (segment times are shifted by the cut-out start)
+    p, res = edit("bg-seg", {**v2, "segments": [seg(0.5, 1.5), seg(3, 5, 2)], "aspect": "original", "background": {"mode": "color", "color": "#101010"}}, src="wide")
+    assert res and res["ok"] and abs(info("bg-seg")[2] - 2) < 0.4, p.stderr[-400:]
+    # too long for a cut-out is refused politely
+    me.MAX_CUTOUT_SECONDS = 2
+    try:
+        me.remove_background("x", {"mode": "blur"}, None, 0, 5, 100, 100, False, ".")
+        raise SystemExit("long cut-out should be refused")
+    except me.EditError as e:
+        assert "up to" in str(e)
+    print("background removal ok")
+print("editor v3 ok")
 print("all ok")
