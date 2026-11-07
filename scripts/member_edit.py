@@ -519,7 +519,9 @@ def main() -> int:
     except EditError as e:
         result = {"ok": False, "error": str(e)}
     except Exception as e:  # noqa: BLE001
-        print(f"unexpected error: {type(e).__name__}", file=sys.stderr)
+        import traceback
+        print(f"unexpected error: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr)
+        print("".join(traceback.format_exc().splitlines(True)[-8:]), file=sys.stderr)  # file names and lines only, never a link (those are masked)
         result = {"ok": False, "error": "The editor could not process this video."}
     if res_url:
         try:
