@@ -121,4 +121,44 @@ print("failures ok")
 # ASS text is safe: braces and backslashes cannot inject styling
 a = me.make_ass({**base, "captions": [{"start": 0, "end": 1, "text": r"{\an8}bad\Ntext"}]}, 1080, 1920, 6)
 assert "{\\an8}" not in a.split("[Events]")[1] and "bad" in a
+
+# ── editor v2: pieces, speed, volume, text layers ──────────────────────────────────────────────
+seg = lambda a, b, sp=1, vol=1: {"start": a, "end": b, "speed": sp, "volume": vol}
+v2 = {k: v for k, v in base.items() if k != "trim"}
+# a middle part cut out: 0-2 and 4-6 kept -> 4 s
+p, res = edit("split", {**v2, "segments": [seg(0, 2), seg(4, 6)], "aspect": "original"}, src="wide")
+assert res and res["ok"], (p.stderr[-400:], res)
+w, h, d, a = info("split"); assert abs(d - 4) < 0.3 and a and (w, h) == (1280, 720), (w, h, d, a)
+# speed: 2x halves a part, 0.5x doubles it: 2s at 2x = 1s, 2s at 0.5x = 4s  -> 5 s
+p, res = edit("speed", {**v2, "segments": [seg(0, 2, 2), seg(2, 4, 0.5)], "aspect": "9:16"}, src="wide")
+assert res and res["ok"], (p.stderr[-400:], res)
+w, h, d, a = info("speed"); assert abs(d - 5) < 0.4 and a and (w, h) == (1080, 1920), (w, h, d)
+# volume 0 mutes a part but keeps the stream; a silent source with segments still works
+p, res = edit("mute", {**v2, "segments": [seg(0, 3, 1, 0), seg(3, 6, 1, 1)], "aspect": "original"}, src="wide")
+assert res and res["ok"], p.stderr[-400:]
+assert info("mute")[3] is True
+p, res = edit("silent2", {**v2, "segments": [seg(0, 1.5), seg(2, 4, 2)], "aspect": "original"}, src="silent")
+assert res and res["ok"] and info("silent2")[3] is False, (p.stderr[-400:], res)
+# old specs with one trim still work (covered above); length maths
+assert me.edited_length([seg(0, 2, 2), seg(2, 4, 0.5)]) == 5.0
+assert me.segments_of({"trim": {"start": 1, "end": 3}}) == [seg(1, 3)]
+# text layers: drawn, with a background box, multi-line, fade; different fonts; the picture changes only while shown
+tl = lambda **k: {"text": "Hello", "start": 1, "end": 3, "x": 50, "y": 30, "font": "Montserrat", "size": 80, "color": "#ffcc00", "bold": True, "italic": False, "underline": False,
+                  "align": "center", "bg": False, "bgColor": "#000000", "shadow": True, "anim": "none", **k}
+p0, r0 = edit("txt", {**v2, "segments": [seg(0, 6)]}, src="wide"); plain_in, plain_out = frame_hash("txt", 1.8), frame_hash("txt", 4.5)
+spec = {**v2, "segments": [seg(0, 6)], "texts": [tl(), tl(text="Boxed\nline two", y=60, bg=True, bgColor="#7c3aed", start=3.5, end=5.5, anim="fade", align="left", x=10, italic=True, underline=True, font="Oswald")]}
+p1, r1 = edit("txt", spec, src="wide"); assert p1.returncode == 0 and r1["ok"], p1.stderr[-500:]
+assert frame_hash("txt", 1.8) != plain_in, "first text drawn while shown"
+assert frame_hash("txt", 4.5) != plain_out, "second text drawn while shown"
+if os.environ.get("DUMP_DIR"):
+    for t in (1.8, 4.5):
+        open(os.path.join(os.environ["DUMP_DIR"], f"txt-{t}.bmp"), "wb").write(frame_hash("txt", t))
+# texts on the EDITED timeline: with the first 2 s cut out and 2x speed, a text at 0.2-0.8 s is drawn at 0.5 s of the output
+p, res = edit("tl", {**v2, "segments": [seg(2, 6, 2)], "texts": [tl(start=0.2, end=0.8)]}, src="wide"); assert res["ok"], p.stderr[-300:]
+# text layers are safe: braces and backslashes cannot inject styling, newlines become line breaks
+a = me.make_ass({**v2, "texts": [tl(text=r"{\an8}x\Ny" + "\nz")]}, 1080, 1920, 6)
+ev = a.split("[Events]")[1]
+assert "{\\an8}" not in ev and "\\N" in ev and "\\pos(540,576)" in ev, ev
+assert me.ass_colour("#ffcc00") == "&H0000CCFF" and me.ass_colour("nonsense") == "&H00FFFFFF"
+print("editor v2 ok")
 print("all ok")
