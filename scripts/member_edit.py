@@ -48,7 +48,7 @@ def open_job(sealed: str, key_b64: str) -> dict:
 
 
 # ── ffmpeg graph and subtitles (pure, tested) ──────────────────────────────────────────────────
-FONT_PACKAGES = {"Montserrat": "fonts-montserrat", "Roboto": "fonts-roboto", "Open Sans": "fonts-open-sans", "Oswald": "fonts-oswald", "Noto Sans": "fonts-noto-core"}
+FONT_PACKAGES = {"Montserrat": "fonts-montserrat", "Roboto": "fonts-roboto", "Open Sans": "fonts-open-sans", "Bebas Neue": "fonts-bebas-neue", "Noto Sans": "fonts-noto-core"}
 
 
 def segments_of(spec: dict) -> list:
@@ -231,7 +231,8 @@ def curl_put(url, path, content_type):
 
 
 def ensure_fonts(spec: dict, need_subtitles: bool):
-    """The runner image has no Noto/Montserrat/... fonts. Installs the ones the edit uses. Best effort, never fatal."""
+    """The runner image lacks the editor's fonts. Installs the packages for the ones this edit uses, one at a time so a package
+    that cannot be installed never blocks the others. Best effort, never fatal."""
     if not need_subtitles or os.environ.get("SKIP_FONT_INSTALL"):
         return
     try:
@@ -239,9 +240,14 @@ def ensure_fonts(spec: dict, need_subtitles: bool):
         missing = [f for f in sorted(wanted) if f in FONT_PACKAGES and not subprocess.run(["fc-list", f], capture_output=True, text=True, timeout=30).stdout.strip()]
         if not missing:
             return
-        pkgs = sorted({FONT_PACKAGES[f] for f in missing})
-        for cmd in (["sudo", "apt-get", "-o", "Acquire::Retries=2", "update", "-qq"], ["sudo", "apt-get", "-o", "Acquire::Retries=2", "install", "-y", "-qq", *pkgs], ["sudo", "fc-cache", "-f"]):
-            subprocess.run(cmd, timeout=240, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        quiet = dict(timeout=240, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "apt-get", "-o", "Acquire::Retries=2", "update", "-qq"], **quiet)
+        for pkg in sorted({FONT_PACKAGES[f] for f in missing}):
+            subprocess.run(["sudo", "apt-get", "-o", "Acquire::Retries=2", "install", "-y", "-qq", pkg], **quiet)
+        subprocess.run(["sudo", "fc-cache", "-f"], **quiet)
+        still = [f for f in missing if not subprocess.run(["fc-list", f], capture_output=True, text=True, timeout=30).stdout.strip()]
+        if still:
+            print(f"fonts not available, a fallback is used: {', '.join(still)}")
     except Exception as exc:  # noqa: BLE001
         print(f"font setup skipped: {exc}")
 

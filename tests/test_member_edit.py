@@ -146,7 +146,7 @@ assert me.segments_of({"trim": {"start": 1, "end": 3}}) == [seg(1, 3)]
 tl = lambda **k: {"text": "Hello", "start": 1, "end": 3, "x": 50, "y": 30, "font": "Montserrat", "size": 80, "color": "#ffcc00", "bold": True, "italic": False, "underline": False,
                   "align": "center", "bg": False, "bgColor": "#000000", "shadow": True, "anim": "none", **k}
 p0, r0 = edit("txt", {**v2, "segments": [seg(0, 6)]}, src="wide"); plain_in, plain_out = frame_hash("txt", 1.8), frame_hash("txt", 4.5)
-spec = {**v2, "segments": [seg(0, 6)], "texts": [tl(), tl(text="Boxed\nline two", y=60, bg=True, bgColor="#7c3aed", start=3.5, end=5.5, anim="fade", align="left", x=10, italic=True, underline=True, font="Oswald")]}
+spec = {**v2, "segments": [seg(0, 6)], "texts": [tl(), tl(text="Boxed\nline two", y=60, bg=True, bgColor="#7c3aed", start=3.5, end=5.5, anim="fade", align="left", x=10, italic=True, underline=True, font="Bebas Neue")]}
 p1, r1 = edit("txt", spec, src="wide"); assert p1.returncode == 0 and r1["ok"], p1.stderr[-500:]
 assert frame_hash("txt", 1.8) != plain_in, "first text drawn while shown"
 assert frame_hash("txt", 4.5) != plain_out, "second text drawn while shown"
