@@ -267,6 +267,15 @@ def ensure_segmenter(work: str) -> str:
         if r.returncode != 0:
             print("segmentation install failed:", (r.stderr or "")[-300:], file=sys.stderr)
             raise EditError("Background removal is not available right now.")
+        # the packages may have gone into a user directory that did not exist when Python started
+        import importlib, site
+        importlib.invalidate_caches()
+        site.addsitedir(site.getusersitepackages())
+        try:
+            import cv2, mediapipe, numpy  # noqa: F401,F811
+        except ImportError as exc:
+            print("segmentation import failed after install:", exc, file=sys.stderr)
+            raise EditError("Background removal is not available right now.")
     model = os.environ.get("SEGMENTER_MODEL") or os.path.join(work, "selfie.tflite")
     if not os.path.exists(model):
         r = subprocess.run(["curl", "-sS", "-f", "-L", "--retry", "3", "--connect-timeout", "20", "--max-time", "120", "-o", model, SEGMENTER_URL], capture_output=True, text=True)
