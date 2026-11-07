@@ -276,6 +276,11 @@ def ensure_segmenter(work: str) -> str:
         except ImportError as exc:
             print("segmentation import failed after install:", exc, file=sys.stderr)
             raise EditError("Background removal is not available right now.")
+    if sys.platform.startswith("linux") and not os.environ.get("SKIP_APT") and not subprocess.run("ldconfig -p | grep -q libEGL.so.1", shell=True).returncode == 0:
+        # MediaPipe's native library needs the EGL/GLES runtime, which the runner image does not have
+        quiet = dict(timeout=300, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["sudo", "apt-get", "-o", "Acquire::Retries=2", "update", "-qq"], **quiet)
+        subprocess.run(["sudo", "apt-get", "-o", "Acquire::Retries=2", "install", "-y", "-qq", "libegl1", "libgles2"], **quiet)
     model = os.environ.get("SEGMENTER_MODEL") or os.path.join(work, "selfie.tflite")
     if not os.path.exists(model):
         r = subprocess.run(["curl", "-sS", "-f", "-L", "--retry", "3", "--connect-timeout", "20", "--max-time", "120", "-o", model, SEGMENTER_URL], capture_output=True, text=True)
