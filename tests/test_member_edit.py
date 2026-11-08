@@ -43,9 +43,9 @@ def make_src(name, w, h, secs=6, audio=True):
         STORE[f"/{name}"] = open(p, "rb").read()
 
 
-def edit(name, spec, src=None, env_extra=None, assets=None):
+def edit(name, spec, src=None, env_extra=None, assets=None, kinds=None):
     for k in ("out", "thumb", "res"): STORE.pop(f"/{name}-{k}", None)
-    job = {"v": 1, "postId": name, "srcUrl": f"{BASE}/{src or name}", "dstUrl": f"{BASE}/{name}-out", "thumbUrl": f"{BASE}/{name}-thumb", "resUrl": f"{BASE}/{name}-res", "spec": spec, "assetUrls": {k: f"{BASE}/{v}" for k, v in (assets or {}).items()}}
+    job = {"v": 1, "postId": name, "srcUrl": f"{BASE}/{src or name}", "dstUrl": f"{BASE}/{name}-out", "thumbUrl": f"{BASE}/{name}-thumb", "resUrl": f"{BASE}/{name}-res", "spec": spec, "assetUrls": {k: f"{BASE}/{v}" for k, v in (assets or {}).items()}, "assetKinds": kinds or {}}
     env = {**os.environ, "JOB": seal(job), "MEMBER_EDIT_KEY": KEY, "SKIP_FONT_INSTALL": "1", **(env_extra or {})}
     p = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "..", "scripts", "member_edit.py")], env=env, capture_output=True, text=True)
     res = json.loads(STORE[f"/{name}-res"]) if f"/{name}-res" in STORE else None
@@ -195,6 +195,21 @@ for motion in me.PHOTO_MOTIONS:
 # a photo with a sticker and a text on top
 p, res = edit("ph-all", {**v2, "segments": [seg(0, 4)], "photo": {"seconds": 4, "motion": "zoom-out"}, "overlays": [ov(start=0, end=4)], "texts": [tl(start=0, end=4)]}, src="photo", assets={"st1": "sticker"})
 assert res and res["ok"], p.stderr[-500:]
+
+# intro and outro: a picture before, a video (with sound) after; the finished video is the sum and keeps one size
+make_src("bumper", 640, 480, 2)
+bk = {"in1": "image", "out1": "video"}
+p, res = edit("io1", {**v2, "segments": [seg(0, 4)], "intro": {"assetId": "in1", "seconds": 3}, "outro": {"assetId": "out1", "seconds": 3}}, src="wide", assets={"in1": "photo", "out1": "bumper"}, kinds=bk)
+assert p.returncode == 0 and res and res["ok"], p.stderr[-600:]
+w, h, d, a = info("io1"); assert (w, h) == (1080, 1920) and abs(d - 9) < 0.5 and a, (w, h, d, a)
+assert abs(res["durationSec"] - 9) < 0.5
+assert frame_hash("io1", 1) != frame_hash("io1", 5), "intro picture differs from the video"
+# only an outro; a silent main video still gets sound track so the join works
+p, res = edit("io2", {**v2, "segments": [seg(0, 3)], "outro": {"assetId": "out1", "seconds": 3}}, src="silent", assets={"out1": "bumper"}, kinds=bk)
+assert res and res["ok"] and abs(res["durationSec"] - 5) < 0.5, p.stderr[-600:]
+# a missing intro is skipped, not fatal
+p, res = edit("io3", {**v2, "segments": [seg(0, 3)], "intro": {"assetId": "gone", "seconds": 3}}, src="wide")
+assert res and res["ok"] and abs(res["durationSec"] - 3) < 0.5, p.stderr[-300:]
 
 if os.environ.get("TEST_SEGMENTATION"):
     for mode, extra in [("color", {"color": "#00b140"}), ("gradient", {"color": "#112233", "color2": "#ff0066"}), ("blur", {}), ("image", {"assetId": "bg1"})]:

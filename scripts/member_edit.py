@@ -252,6 +252,52 @@ def photo_video(img: str, photo: dict, work: str) -> str:
     return out
 
 
+# ── intro and outro ────────────────────────────────────────────────────────────────────────────
+MAX_BUMPER_SECONDS = 15.0
+
+
+def join_media(main: str, spec: dict, assets: dict, kinds: dict, work: str, w: int, h: int) -> str:
+    """Puts the member's intro before and outro after the finished video. A picture shows for `seconds`, a video plays (up to 15 s)
+    with its own sound. Every piece is fitted to the video's size, so the join is seamless. Returns the joined file (or `main`)."""
+    pieces = []
+    for name in ("intro", "outro"):
+        b = spec.get(name)
+        if b and b.get("assetId") in assets:
+            pieces.append((name, assets[b["assetId"]], kinds.get(b["assetId"]) == "video", float(b.get("seconds") or 3)))
+    if not pieces:
+        return main
+    order = [p for p in pieces if p[0] == "intro"] + [("main", main, True, 0.0)] + [p for p in pieces if p[0] == "outro"]
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
+    chains, labels, n = [], [], 0
+    for name, path, is_video, secs in order:
+        if name == "main":
+            _, _, dur, has_a = probe(path)
+            cmd += ["-i", path]
+        elif is_video:
+            _, _, dur, has_a = probe(path)
+            dur = min(dur, MAX_BUMPER_SECONDS)
+            cmd += ["-t", str(round(dur, 3)), "-i", path]
+        else:
+            dur, has_a = max(1.0, min(10.0, secs)), False
+            cmd += ["-loop", "1", "-framerate", str(FPS), "-t", str(dur), "-i", path]
+        v = n
+        n += 1
+        chains.append(f"[{v}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS},format=yuv420p[v{v}]")
+        if has_a:
+            chains.append(f"[{v}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=0:{round(dur, 3)},asetpts=PTS-STARTPTS[a{v}]")
+        else:
+            cmd += ["-f", "lavfi", "-t", str(round(dur, 3)), "-i", "anullsrc=r=44100:cl=stereo"]
+            chains.append(f"[{n}:a]aformat=sample_fmts=fltp:channel_layouts=stereo[a{v}]")
+            n += 1
+        labels.append(f"[v{v}][a{v}]")
+    graph = ";".join(chains) + ";" + "".join(labels) + f"concat=n={len(order)}:v=1:a=1[v][a]"
+    out = os.path.join(work, "joined.mp4")
+    cmd += ["-filter_complex", graph, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-movflags", "+faststart", "-r", str(FPS), out]
+    run(cmd, "Adding your intro and outro")
+    return out
+
+
 # ── background removal ─────────────────────────────────────────────────────────────────────────
 SEGMENTER_URL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
 MAX_CUTOUT_SECONDS = 180
@@ -497,6 +543,7 @@ def render(job: dict, work: str) -> dict:
     thumb = os.path.join(work, "thumb.jpg")
     run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", str(min(spec.get("thumbnailAt", 0), max(0, length - 0.1))), "-i", out, "-frames:v", "1", "-vf", "scale=720:-2", "-q:v", "3", thumb], "Making the thumbnail", 120)
 
+    out = join_media(out, spec, assets, job.get("assetKinds") or {}, work, ow, oh)
     _, _, out_duration, _ = probe(out)
     curl_put(job["dstUrl"], out, "video/mp4")
     curl_put(job["thumbUrl"], thumb, "image/jpeg")
