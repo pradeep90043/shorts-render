@@ -1,14 +1,13 @@
-name: Pieces Cloud Video Renderer
+name: Pieces Cloud Clip Renderer
 
-# Renders one piece-engine video (engines/pieces): downloads the bundle the server prepared (plan.json, narration, the pieces drawn for this video AND the
-# engine code itself, so this workflow needs nothing from the repo), renders the frames with Skia, burns the captions with libass (Hindi needs real text
-# shaping) and uploads video.mp4. The server then runs its QA gate on the result.
+# Renders the PICTURES of one piece-engine video (engines/pieces): one silent clip per narrated line (scene_000.mp4 ...). The captions, voice, music and branding
+# are the normal video pipeline's job. Downloads the bundle the server prepared (plan.json, the pieces drawn for this video AND the engine code itself, so this
+# workflow needs nothing from the repo) and uploads the clips as one artifact. The server then runs its QA on them.
 on:
   workflow_dispatch:
     inputs:
       job_id: { description: "Bundle token", required: true }
       bundle_url: { description: "URL of the bundle tar.gz", required: true }
-      captions: { description: "skia | ass", required: false, default: "ass" }
 
 concurrency:
   group: pieces-render-${{ inputs.job_id }}
@@ -23,21 +22,19 @@ jobs:
         with: { python-version: "3.11" }
       - name: Python packages
         run: pip install --quiet skia-python pillow numpy
-      - name: ffmpeg (libass) and fonts
+      - name: ffmpeg and the libraries skia needs
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg fonts-noto-core fonts-dejavu-core libegl1 libgl1 libfontconfig1
-          fc-cache -f
-          ffmpeg -hide_banner -filters | grep -E " ass " || { echo "this ffmpeg has no libass"; exit 1; }
+          sudo apt-get install -y -qq ffmpeg libegl1 libgl1 libfontconfig1 fonts-dejavu-core
       - name: Download the bundle
         run: |
           mkdir -p job
           curl -fsSL --retry 4 -A "shorts-automation-renderer" "${{ inputs.bundle_url }}" -o bundle.tar.gz
           tar -xzf bundle.tar.gz -C job
-      - name: Render
-        run: python3 job/engines/pieces/run_job.py job video.mp4 --no-draw --captions "${{ inputs.captions }}"
+      - name: Render the clips
+        run: python3 job/engines/pieces/run_job.py job clips --no-draw
       - uses: actions/upload-artifact@v4
         with:
           name: rendered-pieces-${{ inputs.job_id }}
-          path: video.mp4
+          path: clips
           retention-days: 1
